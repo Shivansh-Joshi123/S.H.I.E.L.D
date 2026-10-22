@@ -1,0 +1,28 @@
+spring:
+  application:
+    name: shield-backend-test
+  datasource:
+    url: jdbc:h2:mem:shieldtest;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: false
+  h2:
+    console:
+      enabled: false
+
+shield:
+  simulation:
+    total-cable-length-km: 10.0
+    reference-voltage-v: 11000.0
+    supply-frequency-hz: 50.0
+    voltage-drop-threshold-percent: 20.0
+    overcurrent-threshold-multiplier: 1.5
+    undercurrent-threshold-percent: 90.0
+    fault-confirmation-samples: 2
+    tick-interval-ms: 1000
+    sensor-noise-percent: 0.0
+    auto-isolation: true

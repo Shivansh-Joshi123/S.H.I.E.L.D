@@ -1,0 +1,60 @@
+spring:
+  application:
+    name: shield-backend
+
+  datasource:
+    url: jdbc:h2:file:./data/shielddb;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+server:
+  port: 8080
+  servlet:
+    context-path: /
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    com.shield: DEBUG
+    org.springframework.web: INFO
+
+shield:
+  simulation:
+    # Default network configuration
+    total-cable-length-km: 10.0
+    reference-voltage-v: 11000.0
+    supply-frequency-hz: 50.0
+    # Detection thresholds
+    voltage-drop-threshold-percent: 20.0
+    overcurrent-threshold-multiplier: 1.5
+    undercurrent-threshold-percent: 90.0
+    # Fault confirmation (number of consecutive abnormal samples)
+    fault-confirmation-samples: 3
+    # Simulation tick rate in milliseconds
+    tick-interval-ms: 1000
+    # Sensor noise level (% of reading)
+    sensor-noise-percent: 1.0
+    # Auto isolation mode (true = automatic, false = manual)
+    auto-isolation: true
