@@ -100,6 +100,18 @@ public class SimulationController {
         return ResponseEntity.ok(FaultRecordDto.from(record));
     }
 
+    @PostMapping("/segments/{id}/reroute")
+    public ResponseEntity<SegmentDto> rerouteViaBackup(@PathVariable Long id) {
+        com.shield.domain.CableSegment segment = engine.engageBackupNode(id, "MANAGER_MANUAL");
+        return ResponseEntity.ok(SegmentDto.from(segment));
+    }
+
+    @PostMapping("/segments/{id}/restore")
+    public ResponseEntity<SegmentDto> restorePrimaryRoute(@PathVariable Long id) {
+        com.shield.domain.CableSegment segment = engine.restorePrimaryRoute(id, "MANAGER_MANUAL");
+        return ResponseEntity.ok(SegmentDto.from(segment));
+    }
+
     @PostMapping("/isolate")
     public ResponseEntity<?> triggerIsolation() {
         engine.isolateFault(null);

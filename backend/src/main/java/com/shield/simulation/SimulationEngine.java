@@ -21,21 +21,11 @@ import java.util.function.Consumer;
 /**
  * The central simulation engine.
  *
- * Implements the state machine:
+ * Implements the state machine with per-node backup redundancy and manager-triggered failover:
  *   NORMAL_MONITORING → FAULT_SUSPECTED → FAULT_CONFIRMED
  *   → FAULT_LOCALIZED → FAULT_ISOLATED
- *   → SUPPLY_RESTORED or REROUTING_FAILED
- *
- * The backend is the single source of truth for simulation state.
- * All state changes are persisted immediately to the database.
- *
- * This engine uses Spring's @Scheduled to advance the simulation on
- * each tick (default: every 1 second). This drives the periodic
- * measurement, detection, and state machine advancement.
- *
- * THREAD SAFETY: The engine uses AtomicReference for state that may
- * be read from REST controllers concurrently. The @Transactional
- * database operations are isolated per tick.
+ *   → [Manager clicks "Reroute via Backup"] → SUPPLY_RESTORED
+ *   → [Maintenance repairs cable & clears fault] → FAULT_CLEARED / NORMAL_MONITORING
  */
 @Service
 public class SimulationEngine {
@@ -45,6 +35,7 @@ public class SimulationEngine {
     private final CableSegmentRepository segmentRepo;
     private final RelayRepository relayRepo;
     private final BackupFeederRepository feederRepo;
+    private final ElectricalLoadRepository loadRepo;
     private final FaultRecordRepository faultRecordRepo;
     private final SensorMeasurementRepository measurementRepo;
     private final FaultEventRepository eventRepo;
@@ -69,6 +60,7 @@ public class SimulationEngine {
     public SimulationEngine(CableSegmentRepository segmentRepo,
                              RelayRepository relayRepo,
                              BackupFeederRepository feederRepo,
+                             ElectricalLoadRepository loadRepo,
                              FaultRecordRepository faultRecordRepo,
                              SensorMeasurementRepository measurementRepo,
                              FaultEventRepository eventRepo,
@@ -80,6 +72,7 @@ public class SimulationEngine {
         this.segmentRepo = segmentRepo;
         this.relayRepo = relayRepo;
         this.feederRepo = feederRepo;
+        this.loadRepo = loadRepo;
         this.faultRecordRepo = faultRecordRepo;
         this.measurementRepo = measurementRepo;
         this.eventRepo = eventRepo;
@@ -137,15 +130,18 @@ public class SimulationEngine {
         activeFault.set(null);
         currentPhase.set(SimulationPhase.SYSTEM_RESET);
 
-        // Reset all segment statuses
+        // Reset all segment statuses and backup active flags
         List<CableSegment> segments = segmentRepo.findAllByOrderBySequenceOrderAsc();
         for (CableSegment seg : segments) {
             seg.setStatus(SegmentStatus.HEALTHY);
+            seg.setBackupActive(false);
+            seg.setBackupVoltageV(0.0);
+            seg.setBackupCurrentA(0.0);
             seg.resetAbnormalCount();
             segmentRepo.save(seg);
         }
 
-        // Close all isolation relays (restore to closed)
+        // Close all primary isolation relays
         List<Relay> isolationRelays = relayRepo.findByType(RelayType.ISOLATION);
         for (Relay r : isolationRelays) {
             r.setState(RelayState.CLOSED);
@@ -154,25 +150,27 @@ public class SimulationEngine {
             relayRepo.save(r);
         }
 
-        // Close backup relays
+        // Open all backup bypass relays (return to standby)
         List<Relay> backupRelays = relayRepo.findByType(RelayType.BACKUP);
         for (Relay r : backupRelays) {
-            r.setState(RelayState.CLOSED);
+            r.setState(RelayState.OPEN);
+            r.setLastOperatedAt(Instant.now());
+            r.setLastOperatedBy("SYSTEM_RESET");
             relayRepo.save(r);
         }
 
-        // Reset backup feeders
+        // Reset global backup feeder
         feederRepo.findAll().forEach(f -> { f.setActive(false); feederRepo.save(f); });
 
-        // Reset load supply
-        segmentRepo.findAll().forEach(s -> {
-            recalcNormalMeasurements();
-        });
+        // Reset electrical loads to supplied
+        loadRepo.findAll().forEach(l -> { l.setSupplied(true); loadRepo.save(l); });
+
+        recalcNormalMeasurements();
 
         closeSession();
         recordEvent(EventType.SIMULATION_RESET, null, null, "System reset to normal state.");
         notify(NotificationType.SYSTEM_NORMAL, "System Reset",
-            "All segments restored to healthy state. Historical records preserved.", "INFO");
+            "All segments restored to healthy state. Primary corridors active, backup nodes on standby.", "INFO");
 
         currentPhase.set(SimulationPhase.NORMAL_MONITORING);
         broadcastState();
@@ -200,7 +198,6 @@ public class SimulationEngine {
         // Default distance: midpoint of the segment
         double injectedDistance;
         if (distanceKm != null) {
-            // Calculate absolute distance from source
             double segmentStart = getSegmentStartDistance(segment);
             if (distanceKm < segmentStart || distanceKm > segmentStart + segment.getLengthKm()) {
                 throw ShieldException.validationError(String.format(
@@ -209,7 +206,6 @@ public class SimulationEngine {
             }
             injectedDistance = distanceKm;
         } else {
-            // Default: midpoint of segment
             double segStart = getSegmentStartDistance(segment);
             injectedDistance = segStart + segment.getLengthKm() / 2.0;
         }
@@ -236,7 +232,7 @@ public class SimulationEngine {
         // Transition phase
         currentPhase.set(SimulationPhase.FAULT_SUSPECTED);
 
-        // Record event
+        // Record events
         recordEvent(EventType.FAULT_INJECTED, segmentId, segment.getName(),
             String.format("Fault injected: type=%s, segment=%s, actual distance=%.2f km",
                 faultType, segment.getName(), injectedDistance));
@@ -263,7 +259,7 @@ public class SimulationEngine {
         List<CableSegment> segments = segmentRepo.findAllByOrderBySequenceOrderAsc();
         ActiveFaultState fault = activeFault.get();
 
-        // Calculate measurements
+        // Calculate measurements for primary and backup lines
         CircuitCalculator.MeasurementResult[] results =
             calculator.calculate(segments, fault, true);
 
@@ -275,13 +271,33 @@ public class SimulationEngine {
 
             seg.setLastVoltageV(r.voltageV());
             seg.setLastCurrentA(r.currentA());
+            seg.setBackupVoltageV(r.backupVoltageV());
+            seg.setBackupCurrentA(r.backupCurrentA());
             seg.setLastUpdated(Instant.now());
             segmentRepo.save(seg);
 
+            double recordedV = r.voltageV() > 0 ? r.voltageV() : r.backupVoltageV();
+            double recordedA = r.currentA() > 0 ? r.currentA() : r.backupCurrentA();
+
             measurementRepo.save(new SensorMeasurement(
                 seg.getId(), seg.getName(), sessionId,
-                r.voltageV(), r.currentA(), seg.getStatus(),
+                recordedV, recordedA, seg.getStatus(),
                 fault != null));
+        }
+
+        // Dynamically update electrical load supplied status
+        boolean allStagesEnergized = true;
+        for (CableSegment seg : segments) {
+            if (!seg.isBackupActive() && (seg.getStatus() == SegmentStatus.ISOLATED || seg.getStatus() == SegmentStatus.DE_ENERGIZED)) {
+                allStagesEnergized = false;
+                break;
+            }
+        }
+        for (ElectricalLoad load : loadRepo.findAll()) {
+            if (load.isSupplied() != allStagesEnergized) {
+                load.setSupplied(allStagesEnergized);
+                loadRepo.save(load);
+            }
         }
 
         // Advance state machine
@@ -303,8 +319,10 @@ public class SimulationEngine {
             case FAULT_LOCALIZED -> {
                 if (props.isAutoIsolation()) isolateFault(fault);
             }
-            case FAULT_ISOLATED -> rerouteSupply(segments);
-            default -> {} // NORMAL_MONITORING, SUPPLY_RESTORED, REROUTING_FAILED — no auto action
+            case FAULT_ISOLATED -> {
+                // Awaiting manager action to engage backup bypass!
+            }
+            default -> {} // NORMAL_MONITORING, SUPPLY_RESTORED, etc.
         }
     }
 
@@ -352,7 +370,6 @@ public class SimulationEngine {
         segmentRepo.save(segment);
         currentPhase.set(SimulationPhase.FAULT_CONFIRMED);
 
-        // Update fault record
         faultRecordRepo.findById(fault.getFaultRecordId()).ifPresent(r -> {
             r.setDetectedAt(Instant.now());
             r.setPhase(SimulationPhase.FAULT_CONFIRMED);
@@ -375,14 +392,12 @@ public class SimulationEngine {
                                 ActiveFaultState fault) {
         if (fault == null) return;
 
-        // Get voltage at source (first segment) as Vf for report-based method
         double vf = results[0].voltageV();
         double vt = props.getReferenceVoltageV();
         double lt = props.getTotalCableLengthKm();
 
         FaultLocalizer.LocalizationResult locResult = localizer.localizeReportBased(vf, vt, lt);
 
-        // Update fault record
         faultRecordRepo.findById(fault.getFaultRecordId()).ifPresent(r -> {
             r.setFaultVoltageV(vf);
             r.setLocalizedAt(Instant.now());
@@ -423,31 +438,22 @@ public class SimulationEngine {
         CableSegment segment = segmentRepo.findById(targetFault.getSegmentId())
             .orElseThrow(() -> ShieldException.notFound("CableSegment", targetFault.getSegmentId()));
 
-        // Find and open the isolation relay
+        // Find and open the primary isolation relay
         Long relayId = segment.getIsolationRelayId();
-        if (relayId == null) {
-            throw ShieldException.simulationError("No isolation relay configured for segment " + segment.getName());
+        if (relayId != null) {
+            relayRepo.findById(relayId).ifPresent(relay -> {
+                relay.setState(RelayState.OPEN);
+                relay.setLastOperatedAt(Instant.now());
+                relay.setLastOperatedBy("AUTOMATIC");
+                relayRepo.save(relay);
+            });
         }
-
-        Relay relay = relayRepo.findById(relayId)
-            .orElseThrow(() -> ShieldException.notFound("Relay", relayId));
-
-        if (relay.getState() == RelayState.OPEN) {
-            log.info("Relay {} already open", relay.getName());
-            return;
-        }
-
-        relay.setState(RelayState.OPEN);
-        relay.setLastOperatedAt(Instant.now());
-        relay.setLastOperatedBy("AUTOMATIC");
-        relayRepo.save(relay);
 
         segment.setStatus(SegmentStatus.ISOLATED);
         segmentRepo.save(segment);
 
         currentPhase.set(SimulationPhase.FAULT_ISOLATED);
 
-        // Update fault record
         faultRecordRepo.findById(targetFault.getFaultRecordId()).ifPresent(r -> {
             r.setIsolatedAt(Instant.now());
             r.setPhase(SimulationPhase.FAULT_ISOLATED);
@@ -456,74 +462,123 @@ public class SimulationEngine {
         });
 
         recordEvent(EventType.RELAY_OPENED, targetFault.getSegmentId(), targetFault.getSegmentName(),
-            "Relay " + relay.getName() + " opened — segment " + segment.getName() + " isolated.");
+            "Primary isolation relay opened — segment " + segment.getName() + " isolated.");
         recordEvent(EventType.SEGMENT_ISOLATED, targetFault.getSegmentId(), targetFault.getSegmentName(),
-            "Segment " + segment.getName() + " electrically isolated.");
-        notify(NotificationType.SEGMENT_ISOLATED, "Segment Isolated",
-            String.format("Segment %s isolated by relay %s. Proceeding to reroute supply.",
-                segment.getName(), relay.getName()), "WARNING");
+            "Segment " + segment.getName() + " electrically isolated. Ready for manager backup rerouting.");
+        notify(NotificationType.SEGMENT_ISOLATED, "Segment Isolated — Action Required",
+            String.format("Segment %s isolated. Manager can now engage backup node %s to restore power.",
+                segment.getName(), segment.getBackupName()), "WARNING");
 
-        log.info("Segment {} isolated by relay {}", segment.getName(), relay.getName());
+        log.info("Segment {} isolated. Awaiting manager failover trigger.", segment.getName());
     }
 
-    private void rerouteSupply(List<CableSegment> segments) {
-        currentPhase.set(SimulationPhase.REROUTING);
+    // ── Per-Node Manager Failover & Restoration ────────────────────────────────
 
-        BackupFeeder feeder = feederRepo.findFirstByAvailableTrue().orElse(null);
-        ActiveFaultState fault = activeFault.get();
+    @Transactional
+    public CableSegment engageBackupNode(Long segmentId, String operatedBy) {
+        CableSegment segment = segmentRepo.findById(segmentId)
+            .orElseThrow(() -> ShieldException.notFound("CableSegment", segmentId));
 
-        if (feeder == null) {
-            currentPhase.set(SimulationPhase.REROUTING_FAILED);
-            String reason = "No backup feeder configured as available.";
-            updateFaultReroute(fault, false, reason);
-            recordEvent(EventType.REROUTING_FAILED, null, null, reason);
-            notify(NotificationType.REROUTING_FAILED, "Rerouting Failed",
-                "No backup feeder is available. Downstream loads may be de-energized.", "CRITICAL");
-            log.warn("Rerouting failed: {}", reason);
-            return;
+        // Ensure primary relay is OPEN (isolated)
+        if (segment.getIsolationRelayId() != null) {
+            relayRepo.findById(segment.getIsolationRelayId()).ifPresent(r -> {
+                r.setState(RelayState.OPEN);
+                r.setLastOperatedAt(Instant.now());
+                r.setLastOperatedBy(operatedBy != null ? operatedBy : "MANAGER_MANUAL");
+                relayRepo.save(r);
+            });
         }
+        segment.setStatus(SegmentStatus.ISOLATED);
 
-        // Check capacity (simplified: assume all loads)
-        double totalLoadA = segments.stream()
-            .mapToDouble(s -> s.getNormalCurrentA() != null ? s.getNormalCurrentA() : 0)
-            .max().orElse(0);
-
-        if (totalLoadA > feeder.getCapacityAmperes()) {
-            String reason = String.format(
-                "Backup feeder capacity (%.1f A) insufficient for load demand (%.1f A).",
-                feeder.getCapacityAmperes(), totalLoadA);
-            currentPhase.set(SimulationPhase.REROUTING_FAILED);
-            updateFaultReroute(fault, false, reason);
-            recordEvent(EventType.REROUTING_FAILED, null, null, reason);
-            notify(NotificationType.REROUTING_FAILED, "Rerouting Failed", reason, "CRITICAL");
-            log.warn("Rerouting failed: {}", reason);
-            return;
-        }
-
-        // Activate backup
-        feeder.setActive(true);
-        feederRepo.save(feeder);
-
-        // Close backup relay if exists
-        if (feeder.getRelayId() != null) {
-            relayRepo.findById(feeder.getRelayId()).ifPresent(r -> {
+        // Close backup bypass relay
+        if (segment.getBackupRelayId() != null) {
+            relayRepo.findById(segment.getBackupRelayId()).ifPresent(r -> {
                 r.setState(RelayState.CLOSED);
                 r.setLastOperatedAt(Instant.now());
-                r.setLastOperatedBy("AUTOMATIC");
+                r.setLastOperatedBy(operatedBy != null ? operatedBy : "MANAGER_MANUAL");
                 relayRepo.save(r);
             });
         }
 
-        currentPhase.set(SimulationPhase.SUPPLY_RESTORED);
-        updateFaultReroute(fault, true, null);
+        segment.setBackupActive(true);
+        segmentRepo.save(segment);
 
-        recordEvent(EventType.BACKUP_ACTIVATED, null, null,
-            "Backup feeder activated. Downstream supply restored via alternate path.");
-        notify(NotificationType.BACKUP_ACTIVATED, "Backup Power Activated",
-            String.format("Backup feeder '%s' activated. Supply restored to downstream loads.", feeder.getName()),
+        // Update active fault record if exists
+        ActiveFaultState af = activeFault.get();
+        if (af != null) {
+            updateFaultReroute(af, true, null);
+        }
+
+        currentPhase.set(SimulationPhase.SUPPLY_RESTORED);
+
+        recordEvent(EventType.RELAY_CLOSED, segment.getId(), segment.getName(),
+            String.format("Bypass relay for backup node %s closed by %s.",
+                segment.getBackupName(), operatedBy != null ? operatedBy : "MANAGER"));
+
+        recordEvent(EventType.BACKUP_ACTIVATED, segment.getId(), segment.getName(),
+            String.format("Power route shifted through backup node %s. Grid continuity preserved with 100%% uptime.",
+                segment.getBackupName()));
+
+        notify(NotificationType.BACKUP_ACTIVATED, "Power Rerouted via Backup Node",
+            String.format("Power shifted through Backup Node %s. Downstream grid intact while line %s is repaired.",
+                segment.getBackupName(), segment.getName()),
             "INFO");
 
-        log.info("Supply restored via backup feeder: {}", feeder.getName());
+        log.info("Manager engaged backup node {} for segment {}", segment.getBackupName(), segment.getName());
+        broadcastState();
+        return segment;
+    }
+
+    @Transactional
+    public CableSegment restorePrimaryRoute(Long segmentId, String operatedBy) {
+        CableSegment segment = segmentRepo.findById(segmentId)
+            .orElseThrow(() -> ShieldException.notFound("CableSegment", segmentId));
+
+        // Open backup bypass relay
+        if (segment.getBackupRelayId() != null) {
+            relayRepo.findById(segment.getBackupRelayId()).ifPresent(r -> {
+                r.setState(RelayState.OPEN);
+                r.setLastOperatedAt(Instant.now());
+                r.setLastOperatedBy(operatedBy != null ? operatedBy : "MAINTENANCE");
+                relayRepo.save(r);
+            });
+        }
+
+        // Close primary isolation relay
+        if (segment.getIsolationRelayId() != null) {
+            relayRepo.findById(segment.getIsolationRelayId()).ifPresent(r -> {
+                r.setState(RelayState.CLOSED);
+                r.setLastOperatedAt(Instant.now());
+                r.setLastOperatedBy(operatedBy != null ? operatedBy : "MAINTENANCE");
+                relayRepo.save(r);
+            });
+        }
+
+        segment.setBackupActive(false);
+        segment.setStatus(SegmentStatus.HEALTHY);
+        segment.resetAbnormalCount();
+        segmentRepo.save(segment);
+
+        // Clear active fault if on this segment
+        ActiveFaultState af = activeFault.get();
+        if (af != null && af.getSegmentId().equals(segmentId)) {
+            clearFault(af.getFaultRecordId());
+        }
+
+        currentPhase.set(SimulationPhase.NORMAL_MONITORING);
+
+        recordEvent(EventType.RELAY_CLOSED, segment.getId(), segment.getName(),
+            "Primary isolation relay closed. Segment " + segment.getName() + " restored to service.");
+        recordEvent(EventType.FAULT_CLEARED, segment.getId(), segment.getName(),
+            "Power returned to primary route " + segment.getName() + ". Backup node " + segment.getBackupName() + " returned to standby.");
+
+        notify(NotificationType.FAULT_CLEARED, "Primary Route Restored",
+            String.format("Line %s repair completed. Power returned to primary corridor.", segment.getName()),
+            "INFO");
+
+        broadcastState();
+        log.info("Primary route restored for segment {}", segment.getName());
+        return segment;
     }
 
     // ── Manual Relay Control ───────────────────────────────────────────────────
@@ -533,7 +588,6 @@ public class SimulationEngine {
         Relay relay = relayRepo.findById(relayId)
             .orElseThrow(() -> ShieldException.notFound("Relay", relayId));
 
-        // Safety check: prevent closing a relay on an isolated/faulty segment
         if (targetState == RelayState.CLOSED && relay.getType() == RelayType.ISOLATION) {
             if (relay.getSegmentId() != null) {
                 CableSegment seg = segmentRepo.findById(relay.getSegmentId()).orElse(null);
@@ -574,23 +628,43 @@ public class SimulationEngine {
         ActiveFaultState af = activeFault.get();
         if (af != null && af.getFaultRecordId().equals(faultId)) {
             activeFault.set(null);
-            currentPhase.set(SimulationPhase.FAULT_CLEARED);
+            currentPhase.set(SimulationPhase.NORMAL_MONITORING);
 
             // Restore segment
             segmentRepo.findById(record.getSegmentId()).ifPresent(seg -> {
                 seg.setStatus(SegmentStatus.HEALTHY);
                 seg.resetAbnormalCount();
+                // If backup was active, smoothly return to primary
+                if (seg.isBackupActive()) {
+                    seg.setBackupActive(false);
+                    if (seg.getBackupRelayId() != null) {
+                        relayRepo.findById(seg.getBackupRelayId()).ifPresent(r -> {
+                            r.setState(RelayState.OPEN);
+                            r.setLastOperatedAt(Instant.now());
+                            r.setLastOperatedBy("MAINTENANCE");
+                            relayRepo.save(r);
+                        });
+                    }
+                    if (seg.getIsolationRelayId() != null) {
+                        relayRepo.findById(seg.getIsolationRelayId()).ifPresent(r -> {
+                            r.setState(RelayState.CLOSED);
+                            r.setLastOperatedAt(Instant.now());
+                            r.setLastOperatedBy("MAINTENANCE");
+                            relayRepo.save(r);
+                        });
+                    }
+                }
                 segmentRepo.save(seg);
             });
         }
 
         recordEvent(EventType.FAULT_CLEARED, record.getSegmentId(), record.getSegmentName(),
-            "Fault cleared. Segment " + record.getSegmentName() + " returned to healthy state.");
-        notify(NotificationType.FAULT_CLEARED, "Fault Cleared",
-            "Fault on segment " + record.getSegmentName() + " has been cleared by maintenance.", "INFO");
+            "Fault cleared. Line " + record.getSegmentName() + " repaired by maintenance crew and returned to service.");
+        notify(NotificationType.FAULT_CLEARED, "Fault Cleared — Repair Complete",
+            "Fault on segment " + record.getSegmentName() + " has been resolved. Primary power route restored.", "INFO");
 
         broadcastState();
-        log.info("Fault {} cleared", faultId);
+        log.info("Fault {} cleared and primary route restored", faultId);
         return record;
     }
 
@@ -603,6 +677,8 @@ public class SimulationEngine {
         for (int i = 0; i < segs.size(); i++) {
             segs.get(i).setLastVoltageV(results[i].voltageV());
             segs.get(i).setLastCurrentA(results[i].currentA());
+            segs.get(i).setBackupVoltageV(0.0);
+            segs.get(i).setBackupCurrentA(0.0);
             segmentRepo.save(segs.get(i));
         }
     }

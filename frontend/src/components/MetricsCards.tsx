@@ -14,6 +14,8 @@ export const MetricsCards: React.FC<MetricsCardsProps> = ({ status, segments, ba
   const isolatedCount = segments.filter((s) => s.status === 'ISOLATED').length;
   const faultCount = segments.filter((s) => s.status === 'SUSPECTED_FAULT' || s.status === 'CONFIRMED_FAULT').length;
   const loadsSupplied = loads.filter((l) => l.supplied).length;
+  const activeBackupCount = segments.filter((s) => s.backupActive).length;
+  const activeBackupNode = segments.find((s) => s.backupActive);
 
   return (
     <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
@@ -67,8 +69,8 @@ export const MetricsCards: React.FC<MetricsCardsProps> = ({ status, segments, ba
       {/* 4. Backup Feeder */}
       <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5 shadow-sm">
         <div className="flex items-center justify-between text-slate-400 mb-2">
-          <span className="text-xs font-medium">Backup Feeder</span>
-          <ArrowRightLeft className={`w-4 h-4 ${backupFeeder?.active ? 'text-cyan-400' : 'text-slate-500'}`} />
+          <span className="text-xs font-medium">Backup Redundancy</span>
+          <ArrowRightLeft className={`w-4 h-4 ${activeBackupCount > 0 ? 'text-emerald-400 animate-pulse' : 'text-slate-500'}`} />
         </div>
         <div className="flex items-baseline space-x-1.5">
           <span
@@ -80,11 +82,11 @@ export const MetricsCards: React.FC<MetricsCardsProps> = ({ status, segments, ba
                 : 'text-rose-400'
             }`}
           >
-            {backupFeeder?.active ? 'ENGAGED' : backupFeeder?.available ? 'STANDBY' : 'OFFLINE'}
+            {activeBackupNode ? `NODE ${activeBackupNode.backupName} ONLINE` : 'ALL 4 STANDBY'}
           </span>
         </div>
         <div className="mt-1 text-[11px] text-slate-400">
-          Cap: {backupFeeder?.capacityAmperes ?? 0} A (11 kV)
+          {activeBackupNode ? `Bypassing ${activeBackupNode.name} (Zero Downtime)` : 'B1–B4 N+1 Standby'}
         </div>
       </div>
 

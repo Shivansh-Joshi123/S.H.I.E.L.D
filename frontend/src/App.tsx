@@ -126,6 +126,24 @@ export const App: React.FC = () => {
     }
   };
 
+  const handleRerouteViaBackup = async (segmentId: number) => {
+    try {
+      await api.rerouteViaBackup(segmentId);
+      await fetchData();
+    } catch (err: any) {
+      alert(err?.response?.data?.message || 'Failed to engage backup bypass');
+    }
+  };
+
+  const handleRestorePrimaryRoute = async (segmentId: number) => {
+    try {
+      await api.restorePrimaryRoute(segmentId);
+      await fetchData();
+    } catch (err: any) {
+      alert(err?.response?.data?.message || 'Failed to restore primary route');
+    }
+  };
+
   const handleClearFault = async (faultId: number) => {
     try {
       await api.clearFault(faultId);
@@ -223,6 +241,8 @@ export const App: React.FC = () => {
               onSelectSegment={(seg) => setSelectedSegment(seg)}
               onToggleRelay={handleToggleRelay}
               onOpenInjectModal={() => setIsInjectModalOpen(true)}
+              onRerouteViaBackup={handleRerouteViaBackup}
+              onRestorePrimaryRoute={handleRestorePrimaryRoute}
             />
 
             {/* Grid of Real-Time Charts & Live Audit Log */}

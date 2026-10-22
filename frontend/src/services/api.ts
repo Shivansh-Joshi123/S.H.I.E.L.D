@@ -9,6 +9,7 @@ import type {
   LocalizationResult,
   FaultType,
   Relay,
+  CableSegment,
 } from '../types';
 
 const API_BASE = '/api';
@@ -31,6 +32,10 @@ export const api = {
   stopSimulation: async () => (await client.post('/simulation/stop')).data,
   resetSimulation: async () => (await client.post('/simulation/reset')).data,
   triggerManualIsolation: async () => (await client.post('/simulation/isolate')).data,
+  rerouteViaBackup: async (segmentId: number): Promise<CableSegment> =>
+    (await client.post(`/simulation/segments/${segmentId}/reroute`)).data,
+  restorePrimaryRoute: async (segmentId: number): Promise<CableSegment> =>
+    (await client.post(`/simulation/segments/${segmentId}/restore`)).data,
 
   // Faults
   injectFault: async (segmentId: number, faultType: FaultType, distanceKm?: number): Promise<FaultRecord> => {

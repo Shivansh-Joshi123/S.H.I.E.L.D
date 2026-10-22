@@ -29,6 +29,11 @@ export interface CableSegment {
   normalVoltageV: number | null;
   normalCurrentA: number | null;
   lastUpdated: string | null;
+  backupRelayId?: number | null;
+  backupName?: string;
+  backupActive?: boolean;
+  backupVoltageV?: number | null;
+  backupCurrentA?: number | null;
 }
 
 export interface Relay {

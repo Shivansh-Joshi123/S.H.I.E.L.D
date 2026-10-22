@@ -32,7 +32,12 @@ public class NetworkDto {
         Double lastCurrentA,
         Double normalVoltageV,
         Double normalCurrentA,
-        Instant lastUpdated
+        Instant lastUpdated,
+        Long backupRelayId,
+        String backupName,
+        boolean backupActive,
+        Double backupVoltageV,
+        Double backupCurrentA
     ) {
         public static SegmentDto from(CableSegment s) {
             return new SegmentDto(
@@ -40,7 +45,9 @@ public class NetworkDto {
                 s.getLengthKm(), s.getResistancePerKm(), s.totalResistanceOhm(),
                 s.getSequenceOrder(), s.getStatus().name(),
                 s.getIsolationRelayId(), s.getLastVoltageV(), s.getLastCurrentA(),
-                s.getNormalVoltageV(), s.getNormalCurrentA(), s.getLastUpdated()
+                s.getNormalVoltageV(), s.getNormalCurrentA(), s.getLastUpdated(),
+                s.getBackupRelayId(), s.getBackupName(), s.isBackupActive(),
+                s.getBackupVoltageV(), s.getBackupCurrentA()
             );
         }
     }

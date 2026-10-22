@@ -13,24 +13,10 @@ import java.util.Random;
 /**
  * The core electrical network calculator.
  *
- * Models the cable network as a series resistor circuit:
- *   [Source VT] ─── [R1] ─── [R2] ─── [R3] ─── [R4] ─── [R_load]
- *
- * All calculations are deterministic given the same input state.
- * Gaussian noise is added separately via addNoise().
- *
- * SIMPLIFIED MODEL ASSUMPTIONS (documented for academic transparency):
- *   1. Uniform resistance per kilometre (constant temperature assumed).
- *   2. Purely resistive circuit — no inductance or capacitance modelled.
- *   3. Single-phase equivalent — three-phase effects not modelled.
- *   4. Lossless ground return path assumed for normal operation.
- *   5. Voltage source is ideal (zero internal resistance).
- *   6. Short-circuit fault resistance approximated as 0.01 Ω (not zero,
- *      to avoid division by zero and represent arc resistance).
- *   7. Ground fault modelled as a parallel resistance to earth (R_ground).
- *
- * These assumptions are appropriate for an academic simulation but would
- * not satisfy protection engineering requirements for real infrastructure.
+ * Models the cable network as a series resistor circuit with per-node parallel backup bypass:
+ *   [Source VT] ─── [Stage 1] ─── [Stage 2] ─── [Stage 3] ─── [Stage 4] ─── [R_load]
+ *   Each Stage i has primary segment S_i and parallel backup node B_i.
+ *   If S_i is isolated and B_i is engaged, current flows through B_i with zero disruption to downstream.
  */
 @Component
 public class CircuitCalculator {
@@ -66,13 +52,17 @@ public class CircuitCalculator {
         int n = segments.size();
         MeasurementResult[] results = new MeasurementResult[n];
 
-        // Build effective resistance array
+        // Build effective resistance array for each stage
         double[] R = new double[n];
         for (int i = 0; i < n; i++) {
             CableSegment seg = segments.get(i);
-            if (seg.getStatus() == SegmentStatus.ISOLATED
+            if (seg.isBackupActive()) {
+                // Current bypassed through backup node B_i (healthy 1.0 Ω branch)
+                R[i] = seg.totalResistanceOhm();
+            } else if (seg.getStatus() == SegmentStatus.ISOLATED
                     || seg.getStatus() == SegmentStatus.DE_ENERGIZED) {
-                R[i] = Double.MAX_VALUE / 2; // open circuit
+                // Primary is isolated and backup has not been engaged -> circuit is broken
+                R[i] = Double.MAX_VALUE / 2;
             } else {
                 R[i] = seg.totalResistanceOhm();
             }
@@ -92,17 +82,20 @@ public class CircuitCalculator {
             }
 
             if (faultSegIdx >= 0) {
-                switch (activeFault.getFaultType()) {
-                    case OPEN_CIRCUIT:
-                        R[faultSegIdx] = Double.MAX_VALUE / 2; // very high resistance
-                        break;
-                    case SHORT_CIRCUIT:
-                        parallelGroundR = SHORT_CIRCUIT_FAULT_RESISTANCE_OHM;
-                        break;
-                    case GROUND_FAULT:
-                        parallelGroundR = GROUND_FAULT_RESISTANCE_OHM;
-                        // Resistance remains normal; ground path adds parallel branch
-                        break;
+                CableSegment faultSeg = segments.get(faultSegIdx);
+                // Fault only affects grid if the segment is still connected and not bypassed!
+                if (!faultSeg.isBackupActive() && faultSeg.getStatus() != SegmentStatus.ISOLATED) {
+                    switch (activeFault.getFaultType()) {
+                        case OPEN_CIRCUIT:
+                            R[faultSegIdx] = Double.MAX_VALUE / 2; // very high resistance
+                            break;
+                        case SHORT_CIRCUIT:
+                            parallelGroundR = SHORT_CIRCUIT_FAULT_RESISTANCE_OHM;
+                            break;
+                        case GROUND_FAULT:
+                            parallelGroundR = GROUND_FAULT_RESISTANCE_OHM;
+                            break;
+                    }
                 }
             }
         }
@@ -110,8 +103,7 @@ public class CircuitCalculator {
         // Calculate load resistance (sum of all loads, simplified as one equivalent)
         double rLoad = calculateLoadResistance(segments);
 
-        // Solve circuit: I = VT / (R_total + R_load)
-        // For ground fault: treat fault node as voltage divider with ground
+        // Solve circuit voltages
         double[] voltages = new double[n + 1];
         voltages[0] = vSource;
 
@@ -123,7 +115,7 @@ public class CircuitCalculator {
             voltages = solveSeries(vSource, R, rLoad, n);
         }
 
-        // Calculate current through each segment
+        // Calculate current through each stage
         double[] currents = new double[n];
         for (int i = 0; i < n; i++) {
             if (R[i] >= Double.MAX_VALUE / 4) {
@@ -134,21 +126,47 @@ public class CircuitCalculator {
             }
         }
 
-        // Package results
+        // Package results for both primary and backup paths
         for (int i = 0; i < n; i++) {
-            double v = voltages[i];
-            double c = currents[i];
+            CableSegment seg = segments.get(i);
+            double vPrimary, cPrimary;
+            double vBackup, cBackup;
 
-            if (addNoise) {
-                v = addNoise(v, props.getSensorNoisePercent());
-                c = addNoise(c, props.getSensorNoisePercent());
+            if (seg.isBackupActive()) {
+                // Power flows through the backup node
+                vPrimary = 0.0;
+                cPrimary = 0.0;
+                vBackup = voltages[i];
+                cBackup = currents[i];
+                if (addNoise) {
+                    vBackup = addNoise(vBackup, props.getSensorNoisePercent());
+                    cBackup = addNoise(cBackup, props.getSensorNoisePercent());
+                }
+            } else if (seg.getStatus() == SegmentStatus.ISOLATED || seg.getStatus() == SegmentStatus.DE_ENERGIZED) {
+                // Completely isolated
+                vPrimary = 0.0;
+                cPrimary = 0.0;
+                vBackup = 0.0;
+                cBackup = 0.0;
+            } else {
+                // Power flows normally through primary
+                vPrimary = voltages[i];
+                cPrimary = currents[i];
+                vBackup = 0.0;
+                cBackup = 0.0;
+                if (addNoise) {
+                    vPrimary = addNoise(vPrimary, props.getSensorNoisePercent());
+                    cPrimary = addNoise(cPrimary, props.getSensorNoisePercent());
+                }
             }
 
-            // Clamp to physical bounds
-            v = Math.max(0.0, v);
-            c = Math.max(0.0, c);
+            // Physical clamps
+            vPrimary = Math.max(0.0, vPrimary);
+            cPrimary = Math.max(0.0, cPrimary);
+            vBackup = Math.max(0.0, vBackup);
+            cBackup = Math.max(0.0, cBackup);
 
-            results[i] = new MeasurementResult(segments.get(i).getId(), v, c);
+            results[i] = new MeasurementResult(seg.getId(), vPrimary, cPrimary, vBackup, cBackup);
         }
 
         return results;
@@ -172,7 +190,7 @@ public class CircuitCalculator {
         double I = (rTotalCircuit > 0) ? vSource / rTotalCircuit : 0;
 
         for (int i = 0; i < n; i++) {
-            double drop = (R[i] < Double.MAX_VALUE / 4) ? I * R[i] : voltages[i]; // all voltage drops here
+            double drop = (R[i] < Double.MAX_VALUE / 4) ? I * R[i] : voltages[i];
             voltages[i + 1] = Math.max(0, voltages[i] - drop);
         }
 
@@ -181,8 +199,6 @@ public class CircuitCalculator {
 
     /**
      * Solves circuit with ground fault at segment faultIdx.
-     * Ground fault creates a parallel path: R_cable || R_ground.
-     * Voltage at fault node = VT * R_parallel / (R_upstream + R_parallel)
      */
     private double[] solveWithGroundFault(double vSource, double[] R, double rLoad,
                                            int faultIdx, double rGround, int n) {
@@ -226,11 +242,8 @@ public class CircuitCalculator {
 
     /**
      * Calculates equivalent load resistance from all loads.
-     * Parallel combination: 1/R_eq = sum(1/R_i)
      */
     private double calculateLoadResistance(List<CableSegment> segments) {
-        // Use a fixed load resistance for now (can be made dynamic)
-        // R_load = V^2/P = 11000^2/1500000 = ~80.67 Ω
         return (11000.0 * 11000.0) / 1_500_000.0;
     }
 
@@ -241,9 +254,15 @@ public class CircuitCalculator {
     }
 
     /**
-     * Immutable result of a single segment calculation.
+     * Immutable result of a single segment calculation, including both primary and backup branches.
      */
-    public record MeasurementResult(Long segmentId, double voltageV, double currentA) {
-        public double powerW() { return voltageV * currentA; }
+    public record MeasurementResult(Long segmentId,
+                                  double voltageV,
+                                  double currentA,
+                                  double backupVoltageV,
+                                  double backupCurrentA) {
+        public double powerW() {
+            return (voltageV * currentA) + (backupVoltageV * backupCurrentA);
+        }
     }
 }
