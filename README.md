@@ -95,4 +95,4 @@ The test suite validates:
 The backend provides a clean REST and SSE interface ready to bridge to physical ESP32 microcontrollers:
 * `POST /api/simulation/faults`: Can receive trigger commands from physical tactile buttons or ADC sensor thresholds.
 * `POST /api/relays/{id}/open` & `POST /api/relays/{id}/close`: Send GPIO signals to physical optocoupled relay modules.
-* `GET /api/events/stream`: Server-Sent Events stream for IoT monitoring dashboards.
+* `GET /api/events/stream`: Server-Sent Events stream for IoT monitoring dashboards..
