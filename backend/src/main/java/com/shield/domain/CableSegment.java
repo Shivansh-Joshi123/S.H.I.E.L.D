@@ -47,6 +47,26 @@ public class CableSegment {
     @Column
     private Long isolationRelayId;
 
+    /** ID of the bypass relay controlling the backup node for this segment */
+    @Column
+    private Long backupRelayId;
+
+    /** Identifier for the backup node paired with this segment (e.g. "B1", "B2") */
+    @Column
+    private String backupName;
+
+    /** Whether the backup bypass route is active and conducting current */
+    @Column
+    private boolean backupActive = false;
+
+    /** Voltage measured at the backup node (V) */
+    @Column
+    private Double backupVoltageV;
+
+    /** Current passing through the backup node (A) */
+    @Column
+    private Double backupCurrentA;
+
     /** Last measured voltage at the sending end of this segment (V) */
     @Column
     private Double lastVoltageV;
@@ -67,7 +87,7 @@ public class CableSegment {
     private Instant lastUpdated;
 
     /** Number of consecutive abnormal samples — used for fault confirmation */
-    @Transient
+    @Column
     private int abnormalSampleCount = 0;
 
     public CableSegment() {}
@@ -118,4 +138,19 @@ public class CableSegment {
     public void setAbnormalSampleCount(int abnormalSampleCount) { this.abnormalSampleCount = abnormalSampleCount; }
     public void incrementAbnormalCount() { this.abnormalSampleCount++; }
     public void resetAbnormalCount() { this.abnormalSampleCount = 0; }
+
+    public Long getBackupRelayId() { return backupRelayId; }
+    public void setBackupRelayId(Long backupRelayId) { this.backupRelayId = backupRelayId; }
+
+    public String getBackupName() { return backupName; }
+    public void setBackupName(String backupName) { this.backupName = backupName; }
+
+    public boolean isBackupActive() { return backupActive; }
+    public void setBackupActive(boolean backupActive) { this.backupActive = backupActive; }
+
+    public Double getBackupVoltageV() { return backupVoltageV; }
+    public void setBackupVoltageV(Double backupVoltageV) { this.backupVoltageV = backupVoltageV; }
+
+    public Double getBackupCurrentA() { return backupCurrentA; }
+    public void setBackupCurrentA(Double backupCurrentA) { this.backupCurrentA = backupCurrentA; }
 }
