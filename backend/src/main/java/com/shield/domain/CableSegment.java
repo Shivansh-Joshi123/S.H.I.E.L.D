@@ -88,7 +88,7 @@ public class CableSegment {
 
     /** Number of consecutive abnormal samples — used for fault confirmation */
     @Column
-    private int abnormalSampleCount = 0;
+    private Integer abnormalSampleCount = 0;
 
     public CableSegment() {}
 
@@ -134,9 +134,9 @@ public class CableSegment {
     public void setNormalCurrentA(Double normalCurrentA) { this.normalCurrentA = normalCurrentA; }
     public Instant getLastUpdated() { return lastUpdated; }
     public void setLastUpdated(Instant lastUpdated) { this.lastUpdated = lastUpdated; }
-    public int getAbnormalSampleCount() { return abnormalSampleCount; }
+    public int getAbnormalSampleCount() { return abnormalSampleCount != null ? abnormalSampleCount : 0; }
     public void setAbnormalSampleCount(int abnormalSampleCount) { this.abnormalSampleCount = abnormalSampleCount; }
-    public void incrementAbnormalCount() { this.abnormalSampleCount++; }
+    public void incrementAbnormalCount() { this.abnormalSampleCount = (this.abnormalSampleCount != null ? this.abnormalSampleCount : 0) + 1; }
     public void resetAbnormalCount() { this.abnormalSampleCount = 0; }
 
     public Long getBackupRelayId() { return backupRelayId; }
